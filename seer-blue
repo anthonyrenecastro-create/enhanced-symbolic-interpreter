@@ -1,0 +1,830 @@
+import random
+import copy
+import uuid
+import math
+import time
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Tuple
+from collections import Counter, defaultdict
+
+
+# ============================================================
+# TRACE / CAUSAL DATA STRUCTURES
+# ============================================================
+
+@dataclass
+class TraceEvent:
+    tick: int
+    opcode: str
+    payload: Any
+    channel: Optional[int] = None
+    domain: Optional[int] = None
+    source: Optional[Tuple[int, int]] = None
+    target: Optional[Tuple[int, int]] = None
+    cause_state_ids: List[str] = field(default_factory=list)
+    cause_memory_keys: List[str] = field(default_factory=list)
+    task_score_before: float = 0.0
+    task_score_after: float = 0.0
+    changed_downstream: bool = False
+    influenced_branch: bool = False
+    influenced_output: bool = False
+    influenced_state: bool = False
+
+
+@dataclass
+class ActiveState:
+    id: str
+    value: float
+    channel: int
+    domain: int
+    coherence: float = 0.0
+    energy: float = 1.0
+    age: int = 0
+    tags: List[str] = field(default_factory=list)
+    influenced_other_state: bool = False
+    influenced_output: bool = False
+
+
+@dataclass
+class MemoryReadRecord:
+    tick: int
+    key: str
+    value: Any
+    consumed_by_branch: bool = False
+    consumed_by_output: bool = False
+    consumed_by_emit: bool = False
+    consumed_by_field: bool = False
+    consumed_by_couple: bool = False
+    changed_downstream: bool = False
+
+
+@dataclass
+class CoordinationTask:
+    min_distinct_domains_emitted: int = 2
+    min_distinct_domains_coupled: int = 2
+    require_memory_use: bool = True
+    require_output: bool = True
+    require_cross_domain_sequence: bool = True
+
+
+# ============================================================
+# MORPHOFIELD RUNTIME
+# ============================================================
+
+@dataclass
+class Runtime:
+    num_channels: int = 4
+    num_domains: int = 6
+    task_spec: CoordinationTask = field(default_factory=CoordinationTask)
+
+    fields: Dict[str, List[List[float]]] = field(default_factory=dict)
+    active_states: List[ActiveState] = field(default_factory=list)
+    retired_states: Dict[str, ActiveState] = field(default_factory=dict)
+
+    memory_bank: Dict[str, Any] = field(default_factory=dict)
+    memory_writes: List[Tuple[int, str, Any]] = field(default_factory=list)
+    memory_reads: List[MemoryReadRecord] = field(default_factory=list)
+
+    attractor_table: Dict[Tuple[int, int], Dict[str, int]] = field(default_factory=dict)
+    output_buffer: List[str] = field(default_factory=list)
+
+    interactions: int = 0
+    transitions: int = 0
+    steps: int = 0
+    failures: int = 0
+    task_score: float = 0.0
+
+    trace: List[TraceEvent] = field(default_factory=list)
+    emitted_effects: List[Tuple[int, float, int, int]] = field(default_factory=list)
+    coupling_effects: List[Tuple[int, int]] = field(default_factory=list)
+    field_updates: List[Tuple[int, str, int, int, float]] = field(default_factory=list)
+
+    # causal provenance
+    state_effects: Dict[str, List[str]] = field(default_factory=lambda: defaultdict(list))
+    current_state_causes: List[str] = field(default_factory=list)
+    current_memory_causes: List[str] = field(default_factory=list)
+    last_memory_event_by_key: Dict[str, int] = field(default_factory=dict)
+    last_state_event_by_id: Dict[str, int] = field(default_factory=dict)
+
+    # performance
+    task_score_history: List[Tuple[int, float]] = field(default_factory=list)
+
+    def __post_init__(self):
+        if not self.fields:
+            self.fields = {
+                "excitability": [[0.5 for _ in range(self.num_domains)] for _ in range(self.num_channels)],
+                "persistence": [[0.2 for _ in range(self.num_domains)] for _ in range(self.num_channels)],
+                "global_phi": [[0.0 for _ in range(self.num_domains)] for _ in range(self.num_channels)],
+                "coherence": [[0.0 for _ in range(self.num_domains)] for _ in range(self.num_channels)],
+            }
+        self.task_score_history.append((self.steps, self.task_score))
+
+    def clamp_coords(self, channel: int, domain: int) -> Tuple[int, int]:
+        return channel % self.num_channels, domain % self.num_domains
+
+    def set_current_state_causes(self, state_ids: List[str]):
+        self.current_state_causes = list(dict.fromkeys(state_ids))
+
+    def set_current_memory_causes(self, keys: List[str]):
+        self.current_memory_causes = list(dict.fromkeys(keys))
+
+    def clear_current_causes(self):
+        self.current_state_causes = []
+        self.current_memory_causes = []
+
+    def distinct_emitted_domains(self) -> set:
+        return {dm for _, _, _, dm in self.emitted_effects}
+
+    def distinct_coupled_domains(self) -> set:
+        ds = set()
+        for s, t in self.coupling_effects:
+            ds.add(s)
+            ds.add(t)
+        return ds
+
+    def has_cross_domain_sequence(self) -> bool:
+        last_domain = None
+        for ev in self.trace:
+            if ev.opcode in {"EMIT", "STATE_EMIT"} and ev.domain is not None:
+                if last_domain is not None and ev.domain != last_domain:
+                    return True
+                last_domain = ev.domain
+            elif ev.opcode in {"COUPLE", "STATE_COUPLE"} and isinstance(ev.payload, dict):
+                src = ev.payload.get("src_domain")
+                dst = ev.payload.get("dst_domain")
+                if src is not None and dst is not None and src != dst:
+                    return True
+        return False
+
+    def has_true_interdomain_dependency(self) -> bool:
+        touched_pairs = set()
+        for ev in self.trace:
+            if ev.opcode in {"COUPLE", "STATE_COUPLE"} and isinstance(ev.payload, dict):
+                src = ev.payload.get("src_domain")
+                dst = ev.payload.get("dst_domain")
+                if src is not None and dst is not None and src != dst:
+                    touched_pairs.add((src, dst))
+            if ev.opcode in {"STATE_EMIT"} and ev.source and ev.target:
+                src_domain = ev.source[1]
+                tgt_domain = ev.target[1]
+                if src_domain is not None and tgt_domain is not None and src_domain != tgt_domain:
+                    touched_pairs.add((src_domain, tgt_domain))
+        return len(touched_pairs) > 0
+
+    def has_useful_memory(self) -> bool:
+        for rec in self.memory_reads:
+            if rec.changed_downstream and (rec.consumed_by_branch or rec.consumed_by_output):
+                return True
+        return False
+
+    def all_states(self) -> List[ActiveState]:
+        return list(self.retired_states.values()) + list(self.active_states)
+
+    def count_useful_states(self) -> int:
+        useful_state_count = 0
+        for st in self.all_states():
+            if st.influenced_other_state and st.influenced_output:
+                useful_state_count += 1
+        return useful_state_count
+
+    def recompute_task_score(self):
+        repeated_attractors = 0
+        for _, bucket in self.attractor_table.items():
+            for _, count in bucket.items():
+                if count >= 2:
+                    repeated_attractors += 1
+
+        inter_domain_ok = self.has_true_interdomain_dependency()
+        memory_ok = self.has_useful_memory()
+        state_ok = self.count_useful_states() > 0
+        output_ok = len(self.output_buffer) > 0
+        attractor_ok = repeated_attractors > 0
+
+        if not inter_domain_ok:
+            self.task_score = 0.0
+            self.task_score_history.append((self.steps, self.task_score))
+            return
+
+        score = 0.0
+        if output_ok:
+            score += 0.15
+        if attractor_ok:
+            score += 0.10
+        if memory_ok:
+            score += 0.25
+        if state_ok:
+            score += 0.25
+        if len(self.distinct_emitted_domains()) >= self.task_spec.min_distinct_domains_emitted:
+            score += 0.15
+        if len(self.distinct_coupled_domains()) >= self.task_spec.min_distinct_domains_coupled:
+            score += 0.10
+
+        self.task_score = min(1.0, score)
+        self.task_score_history.append((self.steps, self.task_score))
+
+    def mark_trace_event_downstream(self, idx: int, *, branch=False, output=False, state=False):
+        if 0 <= idx < len(self.trace):
+            self.trace[idx].changed_downstream = True
+            if branch:
+                self.trace[idx].influenced_branch = True
+            if output:
+                self.trace[idx].influenced_output = True
+            if state:
+                self.trace[idx].influenced_state = True
+
+    def log(self, opcode: str, payload: Any, channel=None, domain=None, source=None, target=None):
+        before = self.task_score
+        self.recompute_task_score()
+        after = self.task_score
+        self.trace.append(
+            TraceEvent(
+                tick=self.steps,
+                opcode=opcode,
+                payload=payload,
+                channel=channel,
+                domain=domain,
+                source=source,
+                target=target,
+                cause_state_ids=list(self.current_state_causes),
+                cause_memory_keys=list(self.current_memory_causes),
+                task_score_before=before,
+                task_score_after=after,
+            )
+        )
+        event_idx = len(self.trace) - 1
+
+        for sid in self.current_state_causes:
+            self.state_effects[sid].append(opcode)
+            self.last_state_event_by_id[sid] = event_idx
+
+        for k in self.current_memory_causes:
+            self.last_memory_event_by_key[k] = event_idx
+
+    def emit_state(self, value: float, channel: int, domain: int, tag: Optional[str] = None):
+        channel, domain = self.clamp_coords(channel, domain)
+        st = ActiveState(
+            id=str(uuid.uuid4()),
+            value=float(value),
+            channel=channel,
+            domain=domain,
+            coherence=self.fields["coherence"][channel][domain],
+            energy=1.0 + self.fields["persistence"][channel][domain],
+            age=0,
+            tags=[tag] if tag else [],
+        )
+        self.active_states.append(st)
+        self.transitions += 1
+        self.emitted_effects.append((self.steps, round(float(value), 6), channel, domain))
+        self.log("EMIT", round(float(value), 6), channel=channel, domain=domain, target=(channel, domain))
+        return st
+
+    def record_attractor(self, channel: int, domain: int, label: str):
+        key = (channel, domain)
+        if key not in self.attractor_table:
+            self.attractor_table[key] = {}
+        self.attractor_table[key][label] = self.attractor_table[key].get(label, 0) + 1
+
+    def update_memory(self, key: str, value: Any):
+        self.memory_bank[key] = value
+        self.memory_writes.append((self.steps, key, value))
+        self.log("UPDATE_MEMORY", {"key": key, "value": value})
+
+    def read_memory(self, key: str) -> Any:
+        val = self.memory_bank.get(key, None)
+        self.memory_reads.append(MemoryReadRecord(tick=self.steps, key=key, value=val))
+        self.log("READ_MEMORY", {"key": key, "value": val})
+        return val
+
+    def mark_memory_use(self, key: str, use_type: str):
+        for rec in reversed(self.memory_reads):
+            if rec.key == key:
+                if use_type == "branch":
+                    rec.consumed_by_branch = True
+                elif use_type == "output":
+                    rec.consumed_by_output = True
+                elif use_type == "emit":
+                    rec.consumed_by_emit = True
+                elif use_type == "field":
+                    rec.consumed_by_field = True
+                elif use_type == "couple":
+                    rec.consumed_by_couple = True
+
+                if use_type in {"branch", "output"}:
+                    rec.changed_downstream = True
+
+                idx = self.last_memory_event_by_key.get(key)
+                if idx is not None:
+                    self.mark_trace_event_downstream(
+                        idx,
+                        branch=(use_type == "branch"),
+                        output=(use_type == "output"),
+                        state=False
+                    )
+                break
+
+    def mark_state_influenced_other_state(self, state_id: str):
+        for st in self.all_states():
+            if st.id == state_id:
+                st.influenced_other_state = True
+                idx = self.last_state_event_by_id.get(state_id)
+                if idx is not None:
+                    self.mark_trace_event_downstream(idx, state=True)
+                break
+
+    def mark_state_influenced_output(self, state_id: str):
+        for st in self.all_states():
+            if st.id == state_id:
+                st.influenced_output = True
+                idx = self.last_state_event_by_id.get(state_id)
+                if idx is not None:
+                    self.mark_trace_event_downstream(idx, output=True)
+                break
+
+    def read_attractor(self, channel: int, domain: int) -> Optional[str]:
+        key = self.clamp_coords(channel, domain)
+        if key not in self.attractor_table or not self.attractor_table[key]:
+            self.log("READ_ATTRACTOR", {"coord": key, "value": None}, channel=key[0], domain=key[1])
+            return None
+        best = max(self.attractor_table[key].items(), key=lambda kv: kv[1])[0]
+        self.log("READ_ATTRACTOR", {"coord": key, "value": best}, channel=key[0], domain=key[1])
+        return best
+
+    def retire_state(self, st: ActiveState):
+        self.retired_states[st.id] = copy.deepcopy(st)
+
+    def tick_states(self):
+        new_states = []
+        produced_effects = 0
+
+        for st in self.active_states:
+            st.age += 1
+            ex = self.fields["excitability"][st.channel][st.domain]
+            pe = self.fields["persistence"][st.channel][st.domain]
+            co = self.fields["coherence"][st.channel][st.domain]
+            gp = self.fields["global_phi"][st.channel][st.domain]
+
+            st.energy = st.energy * (0.82 + 0.12 * pe)
+            st.coherence = 0.65 * st.coherence + 0.35 * co
+            st.value = st.value * (0.88 + 0.08 * ex)
+
+            label = f"{round(st.value, 2)}|c{st.channel}d{st.domain}"
+            self.record_attractor(st.channel, st.domain, label)
+
+            self.set_current_state_causes([st.id])
+
+            # 1. High-energy states reinforce local coherence
+            if st.energy > 0.6:
+                self.fields["coherence"][st.channel][st.domain] = min(
+                    1.0,
+                    self.fields["coherence"][st.channel][st.domain] + 0.05
+                )
+                self.field_updates.append(
+                    (self.steps, "coherence", st.channel, st.domain, self.fields["coherence"][st.channel][st.domain])
+                )
+                self.log(
+                    "STATE_FIELD_UPDATE",
+                    {"state": st.id, "field": "coherence", "delta": 0.05},
+                    channel=st.channel,
+                    domain=st.domain
+                )
+                produced_effects += 1
+
+            # 2. Coherent states emit descendants into neighboring domains
+            if st.coherence > 0.45 and st.energy > 0.4:
+                target_domain = (st.domain + 1) % self.num_domains
+                child_value = st.value * 0.5
+                child = self.emit_state(child_value, st.channel, target_domain, tag="state_child")
+                self.log(
+                    "STATE_EMIT",
+                    {"state": st.id, "child_value": round(child_value, 6)},
+                    channel=st.channel,
+                    domain=target_domain,
+                    source=(st.channel, st.domain),
+                    target=(st.channel, target_domain)
+                )
+                self.mark_state_influenced_other_state(st.id)
+                # child inherits causal relation indirectly by being created
+                produced_effects += 1
+
+            # 3. Strong states trigger cross-domain coupling
+            if st.energy > 0.75 and gp > 0.2:
+                target_domain = (st.domain + 2) % self.num_domains
+                if target_domain != st.domain:
+                    self.couple(st.domain, target_domain)
+                    self.log(
+                        "STATE_COUPLE",
+                        {"state": st.id, "src_domain": st.domain, "dst_domain": target_domain},
+                        channel=st.channel,
+                        domain=st.domain,
+                        source=(st.channel, st.domain),
+                        target=(st.channel, target_domain)
+                    )
+                    produced_effects += 1
+
+            # 4. Persistent states write memory
+            if st.age >= 2 and st.coherence > 0.35:
+                mem_key = f"state_{st.channel}_{st.domain}"
+                mem_val = round(st.value, 4)
+                self.update_memory(mem_key, mem_val)
+                self.log(
+                    "STATE_MEMORY_WRITE",
+                    {"state": st.id, "key": mem_key, "value": mem_val},
+                    channel=st.channel,
+                    domain=st.domain
+                )
+                produced_effects += 1
+
+            self.clear_current_causes()
+
+            if st.energy > 0.14 and st.age < 12:
+                new_states.append(st)
+            else:
+                self.retire_state(st)
+
+        self.active_states = new_states
+        self.steps += 1
+        self.log("TICK", {"tick": self.steps, "state_effects": produced_effects})
+
+    def couple(self, src_domain: int, dst_domain: int):
+        src_domain %= self.num_domains
+        dst_domain %= self.num_domains
+        self.interactions += 1
+        self.coupling_effects.append((src_domain, dst_domain))
+        self.log("COUPLE", {"src_domain": src_domain, "dst_domain": dst_domain}, source=(None, src_domain), target=(None, dst_domain))
+
+        for ch in range(self.num_channels):
+            src_coh = self.fields["coherence"][ch][src_domain]
+            self.fields["coherence"][ch][dst_domain] = min(
+                1.0, 0.8 * self.fields["coherence"][ch][dst_domain] + 0.2 * src_coh + 0.05
+            )
+            self.fields["global_phi"][ch][dst_domain] = min(
+                1.0, 0.9 * self.fields["global_phi"][ch][dst_domain] + 0.1 * self.fields["global_phi"][ch][src_domain] + 0.03
+            )
+
+    def spawn_channel(self, from_channel: int):
+        from_channel %= self.num_channels
+        new_channel = (from_channel + 1) % self.num_channels
+        self.log("SPAWN_CHANNEL", {"from": from_channel, "to": new_channel}, source=(from_channel, None), target=(new_channel, None))
+        for d in range(self.num_domains):
+            self.fields["excitability"][new_channel][d] = 0.5 * self.fields["excitability"][new_channel][d] + 0.5 * self.fields["excitability"][from_channel][d]
+            self.fields["persistence"][new_channel][d] = 0.5 * self.fields["persistence"][new_channel][d] + 0.5 * self.fields["persistence"][from_channel][d]
+        self.transitions += 1
+        return new_channel
+
+
+# ============================================================
+# PROGRAM
+# ============================================================
+
+class Program:
+    def __init__(self, body, id=None, lineage=None):
+        self.body = body
+        self.id = id or str(uuid.uuid4())
+        self.lineage = lineage or []
+
+    def run(self, rt: Runtime) -> Dict[str, Any]:
+        env = {}
+        try:
+            self.body.execute(rt, env)
+            success = True
+        except Exception as e:
+            rt.failures += 1
+            env["runtime_error"] = str(e)
+            success = False
+        return {"success": success, "env": env}
+
+
+# ============================================================
+# FITNESS HELPERS
+# ============================================================
+
+def count_instruction_repetition(stmt_strings: List[str]) -> float:
+    n = len(stmt_strings)
+    if n == 0:
+        return 0.0
+    counts = Counter(stmt_strings)
+    return sum(max(0, c - 1) for c in counts.values()) / n
+
+def count_duplicate_blocks(stmt_strings: List[str], min_block=2, max_block=5) -> float:
+    n = len(stmt_strings)
+    if n == 0:
+        return 0.0
+    penalty = 0.0
+    for k in range(min_block, min(max_block, n) + 1):
+        seen = Counter(tuple(stmt_strings[i:i+k]) for i in range(n - k + 1))
+        penalty += sum(max(0, c - 1) * k for c in seen.values())
+    return penalty / n
+
+def is_constant_expr(expr) -> bool:
+    return isinstance(expr, ConstExpr)
+
+def count_null_ops(program: Program) -> float:
+    stmts = program.body.statements
+    n = len(stmts)
+    if n == 0:
+        return 0.0
+    nulls = 0
+    prev_output = None
+    for s in stmts:
+        if isinstance(s, AssignStmt) and isinstance(s.expr, VarExpr) and s.target == s.expr.name:
+            nulls += 1
+        elif isinstance(s, TickStmt) and isinstance(s.count_expr, ConstExpr) and int(s.count_expr.value) == 0:
+            nulls += 1
+        elif isinstance(s, IfStmt) and is_constant_expr(s.cond_expr):
+            nulls += 1
+        elif isinstance(s, OutputStmt) and isinstance(s.expr, ConstExpr):
+            cur = s.expr.value
+            if prev_output == cur:
+                nulls += 1
+            prev_output = cur
+        else:
+            prev_output = None
+    return nulls / n
+
+def dead_write_penalty(program: Program, rt: Runtime) -> float:
+    stmt_strings = flatten_statement_strings(program)
+    n = max(1, len(stmt_strings))
+
+    assigned = []
+    used = set()
+    for s in program.body.statements:
+        if isinstance(s, AssignStmt):
+            assigned.append(s.target)
+        txt = stmt_to_str(s)
+        for v in VAR_NAMES:
+            if v in txt and not (isinstance(s, AssignStmt) and s.target == v):
+                used.add(v)
+
+    unused_bindings = sum(1 for a in assigned if a not in used)
+
+    write_counts = Counter(k for _, k, _ in rt.memory_writes)
+    useful_reads = Counter(rec.key for rec in rt.memory_reads if (
+        rec.changed_downstream and (rec.consumed_by_branch or rec.consumed_by_output)
+    ))
+    unused_memory_writes = sum(1 for k in write_counts if useful_reads.get(k, 0) == 0)
+
+    return (unused_bindings + unused_memory_writes) / n
+
+def memory_usefulness_reward(rt: Runtime) -> float:
+    useful_hits = 0
+    for rec in rt.memory_reads:
+        if rec.changed_downstream and (rec.consumed_by_branch or rec.consumed_by_output):
+            useful_hits += 1
+    return useful_hits / (1 + len(rt.memory_writes))
+
+def distinct_effect_reward(rt: Runtime) -> float:
+    unique_emits = len(set((v, ch, dm) for _, v, ch, dm in rt.emitted_effects))
+    unique_couplings = len(set(rt.coupling_effects))
+    unique_field_updates = len(set((f, ch, dm) for _, f, ch, dm, _ in rt.field_updates))
+    total_effects = len(rt.emitted_effects) + len(rt.coupling_effects) + len(rt.field_updates)
+    return (unique_emits + unique_couplings + unique_field_updates) / (1 + total_effects)
+
+def useful_state_reward(rt: Runtime) -> float:
+    productive = 0
+    total = 0
+    for st in rt.all_states():
+        total += 1
+        if st.influenced_other_state and st.influenced_output:
+            productive += 1
+    return productive / (1 + total)
+
+def population_robustness_reward(rt: Runtime) -> float:
+    domain_counts = Counter()
+    age_sum = 0
+    survivors = 0
+
+    for st in rt.active_states:
+        domain_counts[(st.channel, st.domain)] += 1
+        age_sum += st.age
+        survivors += 1
+
+    if survivors == 0:
+        return 0.0
+
+    spread = len(domain_counts) / max(1, rt.num_channels * rt.num_domains)
+    avg_age = age_sum / survivors
+    age_score = min(1.0, avg_age / 5.0)
+
+    return 0.6 * spread + 0.4 * age_score
+
+def behavioral_efficiency_reward(core_components: Dict[str, float], instr_count: int) -> float:
+    T = core_components["transitions"]
+    M = core_components["memory_usage"]
+    I = core_components["inter_domain"]
+    A = core_components["attractor_stability"]
+    C = core_components["task_completion"]
+    numer = 1.0 * T + 1.0 * M + 1.0 * I + 1.0 * A + 1.0 * C
+    return numer / (1 + math.log(1 + instr_count))
+
+def length_penalty(instr_count: int, k: int = 12) -> float:
+    return instr_count / (instr_count + k) if instr_count > 0 else 0.0
+
+def trace_coherence_reward(rt: Runtime) -> float:
+    improving = 0
+    total = 0
+    for ev in rt.trace:
+        if ev.opcode in {
+            "EMIT", "COUPLE", "SET_FIELD", "MUTATE_FIELD", "UPDATE_MEMORY",
+            "OUTPUT", "READ_MEMORY", "IF", "STATE_FIELD_UPDATE", "STATE_EMIT",
+            "STATE_COUPLE", "STATE_MEMORY_WRITE"
+        }:
+            total += 1
+            if ev.changed_downstream and (ev.task_score_after > ev.task_score_before):
+                improving += 1
+    return improving / max(1, total)
+
+
+# ============================================================
+# FITNESS
+# ============================================================
+
+def score_runtime(program: Program, rt: Runtime, run_result: Dict[str, Any]) -> Dict[str, float]:
+    valid_execution = 1.0 if run_result["success"] else 0.0
+    transitions = min(1.0, rt.transitions / 8.0)
+    memory_usage = min(1.0, len(rt.memory_bank) / 8.0)
+    inter_domain = 1.0 if rt.has_true_interdomain_dependency() else 0.0
+
+    repeated_attractors = 0
+    for _, bucket in rt.attractor_table.items():
+        for _, count in bucket.items():
+            if count >= 2:
+                repeated_attractors += 1
+    attractor_stability = min(1.0, repeated_attractors / 8.0)
+    task_completion = rt.task_score
+
+    core = {
+        "valid_execution": valid_execution,
+        "transitions": transitions,
+        "memory_usage": memory_usage,
+        "inter_domain": inter_domain,
+        "attractor_stability": attractor_stability,
+        "task_completion": task_completion,
+    }
+
+    F_core = (
+        2.5 * valid_execution
+        + 1.0 * transitions
+        + 0.4 * memory_usage
+        + 2.0 * inter_domain
+        + 0.6 * attractor_stability
+        + 2.5 * task_completion
+    )
+
+    stmt_strings = flatten_statement_strings(program)
+    instr_count = len(stmt_strings)
+
+    P_instr_rep = count_instruction_repetition(stmt_strings)
+    P_block_rep = count_duplicate_blocks(stmt_strings)
+    P_null = count_null_ops(program)
+    P_dead_write = dead_write_penalty(program, rt)
+    P_length = length_penalty(instr_count)
+
+    R_mem_useful = memory_usefulness_reward(rt)
+    R_distinct = distinct_effect_reward(rt)
+    R_state_prod = useful_state_reward(rt)
+    R_pop_robust = population_robustness_reward(rt)
+    R_eff = behavioral_efficiency_reward(core, instr_count)
+    R_trace = trace_coherence_reward(rt)
+
+    fitness = (
+        F_core
+        + 1.2 * R_eff
+        + 1.0 * R_distinct
+        + 1.0 * R_mem_useful
+        + 1.2 * R_state_prod
+        + 0.8 * R_pop_robust
+        + 1.0 * R_trace
+        - 1.5 * P_instr_rep
+        - 2.0 * P_block_rep
+        - 1.5 * P_null
+        - 1.2 * P_dead_write
+        - 0.8 * P_length
+    )
+
+    return {
+        **core,
+        "R_eff": R_eff,
+        "R_distinct": R_distinct,
+        "R_mem_useful": R_mem_useful,
+        "R_state_prod": R_state_prod,
+        "R_pop_robust": R_pop_robust,
+        "R_trace": R_trace,
+        "P_instr_rep": P_instr_rep,
+        "P_block_rep": P_block_rep,
+        "P_null": P_null,
+        "P_dead_write": P_dead_write,
+        "P_length": P_length,
+        "instr_count": instr_count,
+        "fitness": fitness,
+        "distinct_emit_domains": len(rt.distinct_emitted_domains()),
+        "distinct_coupled_domains": len(rt.distinct_coupled_domains()),
+        "useful_state_count": rt.count_useful_states(),
+    }
+
+
+# ============================================================
+# EVOLUTION ENGINE
+# ============================================================
+
+class ProgramRecord:
+    def __init__(self, program, metrics, runtime_snapshot):
+        self.program = program
+        self.metrics = metrics
+        self.runtime_snapshot = runtime_snapshot
+
+class MorphoFieldEvolutionEngine:
+    def __init__(self, pop_size=12, program_len=8):
+        self.pop_size = pop_size
+        self.program_len = program_len
+        self.population = [rand_program(program_len) for _ in range(pop_size)]
+        self.generation = 0
+        self.best_history = []
+
+    def evaluate_program(self, program: Program) -> ProgramRecord:
+        rt = Runtime(num_channels=4, num_domains=6, task_spec=CoordinationTask())
+        result = program.run(rt)
+        rt.tick_states()
+        metrics = score_runtime(program, rt, result)
+        return ProgramRecord(program, metrics, rt)
+
+    def select(self, records: List[ProgramRecord]) -> List[ProgramRecord]:
+        records = sorted(records, key=lambda r: r.metrics["fitness"], reverse=True)
+        return records[:max(2, self.pop_size // 3)]
+
+    def reproduce(self, elites: List[ProgramRecord]) -> List[Program]:
+        new_population = []
+        for e in elites[:2]:
+            new_population.append(clone_program(e.program))
+        while len(new_population) < self.pop_size:
+            mode = random.choice(["mutate", "crossover", "fresh"])
+            if mode == "mutate":
+                parent = random.choice(elites).program
+                new_population.append(mutate_program(parent))
+            elif mode == "crossover" and len(elites) >= 2:
+                a = random.choice(elites).program
+                b = random.choice(elites).program
+                new_population.append(crossover_program(a, b))
+            else:
+                new_population.append(rand_program(self.program_len))
+        return new_population[:self.pop_size]
+
+    def step(self):
+        t0 = time.perf_counter()
+        records = [self.evaluate_program(p) for p in self.population]
+        elites = self.select(records)
+        best = elites[0]
+        self.best_history.append(best)
+        self.population = self.reproduce(elites)
+        self.generation += 1
+        batch_ms = (time.perf_counter() - t0) * 1000.0
+        return best, records, batch_ms
+
+
+# ============================================================
+# DEMO / BENCHMARK
+# ============================================================
+
+if __name__ == "__main__":
+    random.seed(42)
+    engine = MorphoFieldEvolutionEngine(pop_size=12, program_len=8)
+
+    for gen in range(10):
+        best, records, batch_ms = engine.step()
+        valid_rate = sum(r.metrics["valid_execution"] for r in records) / len(records)
+
+        print(f"\n=== Generation {gen} ===")
+        print("Batch runtime ms:", round(batch_ms, 3))
+        print("Best fitness:", round(best.metrics["fitness"], 4))
+        print("Core:", {k: round(best.metrics[k], 4) for k in [
+            "valid_execution", "transitions", "memory_usage", "inter_domain",
+            "attractor_stability", "task_completion"
+        ]})
+        print("Coordination:", {
+            "distinct_emit_domains": best.metrics["distinct_emit_domains"],
+            "distinct_coupled_domains": best.metrics["distinct_coupled_domains"],
+            "useful_state_count": best.metrics["useful_state_count"],
+        })
+        print("Rewards:", {k: round(best.metrics[k], 4) for k in [
+            "R_eff", "R_distinct", "R_mem_useful", "R_state_prod", "R_pop_robust", "R_trace"
+        ]})
+        print("Penalties:", {k: round(best.metrics[k], 4) for k in [
+            "P_instr_rep", "P_block_rep", "P_null", "P_dead_write", "P_length"
+        ]})
+        print("Instr count:", best.metrics["instr_count"])
+        print("Valid execution rate:", round(valid_rate, 4))
+        print("Program:")
+        print(program_to_str(best.program))
+
+    final_best = max(engine.best_history, key=lambda r: r.metrics["fitness"])
+    print("\n=== Final Best Program ===")
+    print(program_to_str(final_best.program))
+    print("\n=== Benchmark Check ===")
+    print("Target: runtime < 10 ms per batch")
+    print("Target: valid_execution = 1.0")
+    print("Target: P_block_rep = 0")
+    print("Target: inter_domain = 1.0")
+    print("Target: R_mem_useful > 0.5")
+    print("Target: R_state_prod > 0.2")
+    print("\nFinal best metrics:")
+    print({k: round(final_best.metrics[k], 4) if isinstance(final_best.metrics[k], float) else final_best.metrics[k]
+           for k in final_best.metrics})
