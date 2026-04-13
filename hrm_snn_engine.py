@@ -94,9 +94,16 @@ def bilaplacian(g: List[List[float]]) -> List[List[float]]:
 def gradient_dot_flux(phi: List[List[float]], potential: List[List[float]]) -> List[List[float]]:
     """
     Approximate ∇·(φ∇Φ) used in the φ₅ advection/chemotaxis term.
-    Computed as:  φ·∇²Φ + ∇φ·∇Φ
-    where ∇φ·∇Φ is approximated by (lap_phi * Phi + phi * lap_Phi).
-    This matches the product-rule decomposition described in the problem statement.
+
+    By the product rule:  ∇·(φ∇Φ) = ∇φ·∇Φ + φ∇²Φ
+
+    Both terms are approximated via the discrete Laplacian:
+        ∇φ·∇Φ  ≈  ∇²φ · Φ       (Laplacian of φ scaled by local Φ value)
+        φ·∇²Φ   =  φ · ∇²Φ      (exact product)
+
+    This is a compact operator approximation suitable for the explicit-Euler
+    PDE solver used here.  It preserves the sign and magnitude of the
+    advective drift while remaining numerically stable on the discrete grid.
     """
     R = len(phi)
     C = len(phi[0])
@@ -512,7 +519,7 @@ class HRMState:
     channel: int   = 1
     domain:  int   = 1
     layer:   int   = 1
-    guna:    Tuple[float, float, float] = (0.33, 0.33, 0.34)   # (s, r, t)
+    guna:    Tuple[float, float, float] = (1.0/3.0, 1.0/3.0, 1.0/3.0)   # (s, r, t)
 
     # ------------------------------------------------------------------
     @property
@@ -699,12 +706,15 @@ class StateEngine:
 
     def _coherence_gradient(self, field_engine: Optional[FieldEngine]) -> List[float]:
         """
-        ψ∇_{Sᵢ}C — gradient of a coherence measure C w.r.t. Sᵢ.
-        Here C is approximated as the mean φ₅ (resource/plasticity field),
-        and the gradient is estimated by finite difference:
-            ∂C/∂Sᵢ ≈ (C(Sᵢ+ε) - C(Sᵢ)) / ε
-        For simplicity we use the mean phi5 as a scalar proxy for C,
-        modulated by the sign of Sᵢ.
+        ψ∇_{Sᵢ}C — direction of steepest ascent on coherence C w.r.t. Sᵢ.
+        Here C is approximated as the mean φ₅ (resource/plasticity field).
+
+        Note: this is a sign-based heuristic, not a true finite-difference
+        gradient.  The term encourages each Sᵢ to grow in the direction that
+        aligns with the current resource level: positive Sᵢ is nudged upward
+        when C > 0, negative Sᵢ downward.  A full finite-difference estimate
+        would require re-evaluating the field at Sᵢ ± ε, which is not
+        tractable within the explicit-Euler step.
         """
         if field_engine is None:
             return [0.0] * self.cfg.dim
@@ -1042,8 +1052,8 @@ class SimulationEngine:
         topo = await self._task_topology()
 
         # Stage 2: state + SNN are independent → run concurrently
-        state_task = asyncio.ensure_future(self._task_state(topo))
-        snn_task   = asyncio.ensure_future(self._task_snn())
+        state_task = asyncio.create_task(self._task_state(topo))
+        snn_task   = asyncio.create_task(self._task_snn())
         state_vec, spikes = await asyncio.gather(state_task, snn_task)
 
         # Stage 3: field step depends on spikes and state
@@ -1234,8 +1244,14 @@ async def parameter_sweep(
 def visualise_field(g: List[List[float]], title: str = "",
                     width: int = 44, n_rows: int = 6) -> str:
     """
-    Render a 2-D field as a compact ASCII heatmap using block characters.
+    Render a 2-D field as a compact ASCII heatmap using Unicode block characters.
     Sampled to fit within *width* characters.
+
+    Note: the default character set uses Unicode block-fill characters
+    (U+2591–U+2593, U+2588).  These render correctly on UTF-8 terminals
+    (Linux, macOS, modern Windows Terminal) but may appear as '?' on legacy
+    terminals that lack Unicode support.  In that case replace CHARS with a
+    pure-ASCII palette such as " .:-=#".
     """
     CHARS = " ░▒▓█"
     R = len(g)
